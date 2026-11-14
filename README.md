@@ -7,6 +7,8 @@ Single-page live tracker for selected carriers (FedEx, Air Canada, Sun Country, 
 - **Times:** elapsed / remaining / ETA are *estimates* from great-circle distance and ground speed. Not for operational use.
 - **Watchlist** (carriers, tail numbers, refresh pause) is stored only in your browser's localStorage. No keys or personal data live in this repo.
 
+**Relay:** the feeds block direct browser requests (CORS), so the page calls them through a small Cloudflare Worker. See [relay/README.md](relay/README.md) to deploy it, then paste its URL under ⚙ Watchlist → Relay.
+
 Hosting: GitHub Pages from `main` / root. Open `index.html` on phone or desktop.
 
-Build: FLTK-20261114-0116Z (shipped 2026-11-14T01:16:34Z)
+Build: FLTK-20261114-0140Z (shipped 2026-11-14T01:40:20Z)

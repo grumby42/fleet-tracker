@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="build-id" content="FLTK-20261114-0116Z">
-<meta name="build-utc" content="2026-11-14T01:16:34Z">
+<meta name="build-id" content="FLTK-20261114-0140Z">
+<meta name="build-utc" content="2026-11-14T01:40:20Z">
 <title>FLTK · Fleet Tracker</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
@@ -116,6 +116,10 @@ a{color:var(--acc)}
     <div class="note">One per line. US N-numbers are converted to their transponder (ICAO hex) address automatically; you may also enter a 6-character hex directly. Optional label after a space, e.g. <code>N12345 Flight school 172</code>.</div>
     <textarea id="tails" spellcheck="false" placeholder="N12345 Cessna 172&#10;N678AB"></textarea>
     <div class="note" id="tailCheck"></div>
+    <h2>Relay</h2>
+    <div class="note">The public ADS-B feeds refuse direct requests from web pages (CORS), so the page goes through your Cloudflare Worker relay. Paste its URL, e.g. <code>https://fleet-relay.yourname.workers.dev</code>. Leave blank to try direct.</div>
+    <div style="display:flex;gap:6px"><input id="relayUrl" style="flex:1" placeholder="https://….workers.dev" spellcheck="false"><button id="relayTest">Test</button></div>
+    <div class="note" id="relayMsg"></div>
     <h2>Refresh</h2>
     <label>Pause between sweeps (s) <input id="pauseSec" type="number" min="5" max="600" style="width:80px"></label>
     <div class="note">Settings are kept in this browser only (nothing is sent anywhere or stored in the repo).</div>
@@ -229,6 +233,9 @@ let pauseSec = store.get('pause', 30);
 let scope = store.get('scope', 'us');
 let providerPref = store.get('provider', 'auto');
 let tailsOn = store.get('tailsOn', true);
+const RELAY_DEFAULT = '';
+let relayUrl = store.get('relay', RELAY_DEFAULT) || RELAY_DEFAULT;
+const cleanRelay = u => String(u||'').trim().replace(/\/+$/,'');
 
 function parseTails(text){
   const out = [];
@@ -249,7 +256,7 @@ const aircraft = new Map();   // hex -> record
 const routeMem = new Map();   // callsign -> route|null
 let selected = null;
 let sortKey = store.get('sort', 'carrier'), sortDir = 1;
-const stats = {req:0, ok:0, err:0, bytes:0, lastSweep:null, sweepMs:null, provider:'—', note:'', inFlight:''};
+const stats = {sweepOk:null, req:0, ok:0, err:0, bytes:0, lastSweep:null, sweepMs:null, provider:'—', note:'', inFlight:''};
 
 /* ===== Providers ===== */
 const PROVIDERS = {
@@ -284,18 +291,27 @@ async function feedFetch(kind, arg){
   let lastErr;
   for (const p of order){
     try {
-      const url = kind === 'point' ? PROVIDERS[p].point(arg, 250) : PROVIDERS[p].hex(arg);
+      const url = relayUrl
+        ? (kind === 'point' ? `${relayUrl}/point/${p}/${arg.lat}/${arg.lon}/250?${watchQuery()}` : `${relayUrl}/hex/${p}/${arg}`)
+        : (kind === 'point' ? PROVIDERS[p].point(arg, 250) : PROVIDERS[p].hex(arg));
       const j = await getJSON(url);
-      providerFails[p] = 0; activeProvider = p; stats.provider = p;
+      providerFails[p] = 0; activeProvider = p; stats.provider = (relayUrl ? 'relay → ' : '') + p;
       return j;
     } catch (e) {
       lastErr = e; providerFails[p]++;
-      stats.note = `${p}: ${e.name === 'AbortError' ? 'timeout' : (e.message || 'blocked (network/CORS)')}`;
+      const msg = e.name === 'AbortError' ? 'timeout' : /fetch|network/i.test(e.message||'') ? 'blocked (network/CORS)' : e.message;
+      stats.note = `${relayUrl ? 'relay → ' : ''}${p}: ${msg}`;
     }
   }
   throw lastErr;
 }
 
+function watchQuery(){
+  const cs = carriers.map(c => c.p).filter(x => /^[A-Z0-9]{3}$/.test(x)).join(',');
+  const hex = tails.filter(t => t.hex).map(t => t.hex).join(',');
+  const reg = tails.filter(t => !t.hex && t.reg).map(t => t.reg).join(',');
+  return new URLSearchParams({cs, hex, reg}).toString();
+}
 /* ===== Ingest ===== */
 function carrierFor(cs){
   if (!cs) return null;
@@ -348,7 +364,7 @@ async function routeWorker(){
     const cs = routeQueue.shift();
     if (!cs || document.hidden){ if (cs) routeQueue.unshift(cs); await sleep(1500); continue; }
     try {
-      const j = await getJSON(`https://api.adsbdb.com/v0/callsign/${encodeURIComponent(cs)}`, 10000);
+      const j = await getJSON(relayUrl ? `${relayUrl}/route/${encodeURIComponent(cs)}` : `https://api.adsbdb.com/v0/callsign/${encodeURIComponent(cs)}`, 10000);
       const fr = j?.response?.flightroute;
       const ap = x => x ? {icao:x.icao_code, iata:x.iata_code, name:x.name, city:x.municipality, lat:+x.latitude, lon:+x.longitude} : null;
       const r = fr ? {o: ap(fr.origin), d: ap(fr.destination)} : null;
@@ -377,13 +393,13 @@ async function sweepLoop(){
     if (scope === 'off' || document.hidden){ await sleep(1000); continue; }
     const t0 = Date.now();
     const circles = circlesFor(scope);
-    const seenHex = new Set();
+    const seenHex = new Set(); let okThisSweep = 0;
     for (let i = 0; i < circles.length; i++){
       if (gen !== sweepGen || scope === 'off') break;
       while (document.hidden) await sleep(1000);
       stats.inFlight = `circle ${i+1}/${circles.length}`; renderStatus();
       const ts = Date.now();
-      try { const j = await feedFetch('point', circles[i]); (j.ac||[]).forEach(a => seenHex.add((a.hex||'').toLowerCase())); ingest(j.ac); render(); } catch {}
+      try { const j = await feedFetch('point', circles[i]); okThisSweep++; (j.ac||[]).forEach(a => seenHex.add((a.hex||'').toLowerCase())); ingest(j.ac); render(); } catch {}
       await sleep(Math.max(0, 1100 - (Date.now() - ts)));
     }
     // Tails not caught by the sweep: look up individually.
@@ -393,12 +409,12 @@ async function sweepLoop(){
         if (gen !== sweepGen) break;
         stats.inFlight = `tail ${t.id}`; renderStatus();
         const ts = Date.now();
-        try { const j = await feedFetch('hex', t.hex); ingest(j.ac); render(); } catch {}
+        try { const j = await feedFetch('hex', t.hex); okThisSweep++; ingest(j.ac); render(); } catch {}
         await sleep(Math.max(0, 1100 - (Date.now() - ts)));
       }
     }
     if (gen !== sweepGen) continue;
-    stats.sweepMs = Date.now() - t0; stats.lastSweep = Date.now(); stats.inFlight = 'idle';
+    stats.sweepOk = okThisSweep; stats.sweepMs = Date.now() - t0; stats.lastSweep = Date.now(); stats.inFlight = 'idle';
     expire(); render();
     const until = Date.now() + pauseSec * 1000;
     while (Date.now() < until && gen === sweepGen) await sleep(500);
@@ -513,7 +529,10 @@ function doRender(){
       <td data-l="Seen" class="${ago>90?'warn':''}">${ago}s</td></tr>`;
   }).join('');
   document.getElementById('empty').style.display = rows.length ? 'none' : 'block';
-  document.getElementById('empty').textContent = scope === 'off' ? 'Paused.' : stats.lastSweep ? 'No matching aircraft airborne in range right now.' : 'Waiting for the first sweep…';
+  document.getElementById('empty').textContent = scope === 'off' ? 'Paused.'
+    : (stats.err && !stats.ok) || stats.sweepOk === 0
+      ? (relayUrl ? 'Relay is not returning data — check the relay URL in ⚙ Watchlist (use Test).' : 'Feeds are refusing direct browser requests. Deploy the relay (relay/README.md) and paste its URL in ⚙ Watchlist.')
+    : stats.lastSweep ? 'No matching aircraft airborne in range right now.' : 'Waiting for the first sweep…';
   syncMarkers(); renderDetail();
 }
 function renderChips(){
@@ -571,6 +590,8 @@ function openSettings(){
   drawCarrierRows();
   document.getElementById('tails').value = tailsText;
   document.getElementById('pauseSec').value = pauseSec;
+  document.getElementById('relayUrl').value = relayUrl;
+  document.getElementById('relayMsg').textContent = '';
   checkTails();
   document.getElementById('dlg').showModal();
 }
@@ -610,12 +631,31 @@ function init(){
   document.getElementById('addCarrier').onclick = () => { readCarrierRows(); draftCarriers.push({p:'', n:'New carrier', c:'#cccccc', on:true}); drawCarrierRows(); };
   document.getElementById('carrierRows').onclick = e => { const i = e.target.dataset.del; if (i != null){ readCarrierRows(); draftCarriers.splice(+i,1); drawCarrierRows(); } };
   document.getElementById('tails').oninput = checkTails;
+  document.getElementById('relayTest').onclick = async () => {
+    const u = cleanRelay(document.getElementById('relayUrl').value), m = document.getElementById('relayMsg');
+    if (!u){ m.textContent = 'Enter a URL first.'; return; }
+    m.textContent = 'Testing…';
+    try {
+      const h = await (await fetch(u + '/health', {cache:'no-store'})).json();
+      const parts = [];
+      for (const f of Object.keys(PROVIDERS)){
+        const t0 = Date.now();
+        try {
+          const r = await fetch(`${u}/point/${f}/39.72/-86.29/250?cs=FDX,ACA,SCX,EIN`, {cache:'no-store'}); const j = await r.json();
+          parts.push(r.ok ? `<span style="color:var(--ok)">✓ ${f}</span>: ${j.total} aircraft near IND, ${j.ac.length} watched (${Date.now()-t0} ms)` : `<span class="warn">✗ ${f}</span>: ${esc(j.error||r.status)}`);
+        } catch (e) { parts.push(`<span class="warn">✗ ${f}</span>: ${esc(e.message)}`); }
+      }
+      m.innerHTML = (h.ok ? 'Relay reachable. ' : '') + parts.join('<br>') + '<br>Save to use it. With Feed on Auto, a failing feed is skipped automatically.';
+    } catch (e) { m.innerHTML = `<span style="color:var(--bad)">✗ Could not reach relay</span> (${esc(e.message)}). Check the URL and that ALLOWED_ORIGINS includes this site.`; }
+  };
   document.getElementById('dlgCancel').onclick = () => document.getElementById('dlg').close();
   document.getElementById('dlgReset').onclick = () => { draftCarriers = DEFAULT_CARRIERS.map(c => ({...c})); drawCarrierRows(); document.getElementById('pauseSec').value = 30; };
   document.getElementById('dlgSave').onclick = () => {
     readCarrierRows();
     carriers = draftCarriers.filter(c => /^[A-Z0-9]{3}$/.test(c.p));
     tailsText = document.getElementById('tails').value; tails = parseTails(tailsText);
+    relayUrl = cleanRelay(document.getElementById('relayUrl').value); store.set('relay', relayUrl);
+    stats.req = stats.ok = stats.err = 0; stats.note = ''; stats.sweepOk = null; routeMem.clear();
     pauseSec = Math.min(600, Math.max(5, +document.getElementById('pauseSec').value || 30));
     store.set('carriers', carriers); store.set('tails', tailsText); store.set('pause', pauseSec);
     // re-match existing records against the new watchlist
